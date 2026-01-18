@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -69,53 +69,55 @@ func connect(cfg *Config) (net.Conn, error) {
 // startIO запускает двунаправленный обмен данными между STDIN/STDOUT и соединением.
 // Эта функция не возвращает управление до завершения сеанса.
 func startIO(conn net.Conn) {
-	// Горутина: сокет → stdout
+	done := make(chan struct{})
+	var once sync.Once
+	closeDone := func() {
+		once.Do(func() {
+			close(done)
+		})
+	}
+
 	go func() {
-		reader := bufio.NewReader(conn)
+		buf := make([]byte, 1024)
 		for {
-			buf := make([]byte, 1024)
-			n, err := reader.Read(buf)
+			n, err := conn.Read(buf)
 			if n > 0 {
 				// Пишем ровно столько байт, сколько прочитали
 				if _, writeErr := os.Stdout.Write(buf[:n]); writeErr != nil {
-					// Ошибка записи в stdout — редко, но возможна (например, pipe закрыт)
-					os.Exit(0)
+					closeDone()
+					return
 				}
 			}
 			if err != nil {
-				// EOF или другая ошибка — сервер закрыл соединение
-				os.Exit(0)
+				closeDone()
+				return
 			}
 		}
 	}()
 
-	// Основная горутина: stdin → сокет
-	stdinReader := bufio.NewReader(os.Stdin)
-	writer := bufio.NewWriter(conn)
-
-	for {
+	go func() {
 		buf := make([]byte, 1024)
-		n, err := stdinReader.Read(buf)
-		if n > 0 {
-			if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
-				// Не удалось отправить — соединение мертво
-				os.Exit(0)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				if _, writeErr := conn.Write(buf[:n]); writeErr != nil {
+					closeDone()
+					return
+				}
 			}
-			// Сбрасываем буфер (flush), чтобы данные ушли сразу
-			if flushErr := writer.Flush(); flushErr != nil {
-				os.Exit(0)
+			if err == io.EOF {
+				closeDone()
+				return
+			}
+			if err != nil {
+				closeDone()
+				return
 			}
 		}
-		if err == io.EOF {
-			// Пользователь нажал Ctrl+D
-			conn.Close()
-			os.Exit(0)
-		}
-		if err != nil {
-			// Другая ошибка чтения stdin
-			os.Exit(0)
-		}
-	}
+	}()
+
+	<-done
+	conn.Close()
 }
 
 func main() {
@@ -124,7 +126,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Config: %+v\n", cfg)
 
 	conn, err := connect(cfg)
 	if err != nil {
@@ -132,8 +133,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer conn.Close()
-
-	fmt.Fprintln(os.Stderr, "Connected! Press Ctrl+D to exit.")
 
 	startIO(conn)
 }
